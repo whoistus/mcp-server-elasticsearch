@@ -29,6 +29,8 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use sse_stream::SseStream;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 /// Simple smoke test
 #[tokio::test]
@@ -83,6 +85,8 @@ async fn http_tool_list() -> anyhow::Result<()> {
 // End-to-end test that spawns a mock ES server and calls the `list_indices` tool via http
 #[tokio::test]
 async fn end_to_end() -> anyhow::Result<()> {
+    let _guard = env_lock().lock().await;
+
     // Start an ES mock that will reply to list_indices
     let router = Router::new().route(
         "/_cat/indices/{index}",
@@ -106,8 +110,8 @@ async fn end_to_end() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(LOCALHOST_0).await?;
 
-    // SAFETY: works since this is the only test in this module that sets env vars
-    // TODO: refactor the CLI to accept an alternate source of key/values
+    // SAFETY: env_lock serializes tests that mutate process-wide env vars.
+    // TODO: refactor the CLI to accept an alternate source of key/values.
     unsafe {
         std::env::set_var("ES_URL", format!("http://127.0.0.1:{}/", listener.local_addr()?.port()));
     }
@@ -163,7 +167,119 @@ async fn end_to_end() -> anyhow::Result<()> {
     Ok(())
 }
 
+// End-to-end test that verifies list_indices falls back to mappings when _cat/indices
+// is not allowed for a low-privilege user.
+#[tokio::test]
+async fn list_indices_falls_back_to_mappings_when_cat_indices_is_forbidden() -> anyhow::Result<()> {
+    let _guard = env_lock().lock().await;
+
+    let router = Router::new()
+        .route(
+            "/_cat/indices/{index}",
+            axum::routing::get(async move |Path(index): Path<String>| {
+                assert_eq!(index, "test-index");
+                (
+                    http::StatusCode::FORBIDDEN,
+                    axum::Json(json!({
+                        "error": {
+                            "type": "security_exception",
+                            "reason": "action [indices:monitor/stats] is unauthorized"
+                        },
+                        "status": 403
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/{index}/_mapping",
+            axum::routing::get(async move |headers: HeaderMap, Path(index): Path<String>| {
+                assert_eq!(index, "test-index");
+                assert_eq!(
+                    headers.get("Authorization").unwrap().to_str().unwrap(),
+                    "ApiKey value-from-the-test"
+                );
+                axum::Json(json!({
+                    "test-index": {
+                        "mappings": {
+                            "properties": {
+                                "message": {
+                                    "type": "text"
+                                }
+                            }
+                        }
+                    }
+                }))
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind(LOCALHOST_0).await?;
+
+    // SAFETY: env_lock serializes tests that mutate process-wide env vars.
+    // TODO: refactor the CLI to accept an alternate source of key/values.
+    unsafe {
+        std::env::set_var("ES_URL", format!("http://127.0.0.1:{}/", listener.local_addr()?.port()));
+    }
+    let server = axum::serve(listener, router);
+    tokio::spawn(async { server.await });
+
+    let addr = find_address()?;
+    let cli = cli::Cli {
+        container_mode: false,
+        command: cli::Command::Http(cli::HttpCommand {
+            config: None,
+            address: Some(addr),
+            sse: false,
+        }),
+    };
+
+    tokio::spawn(async move { cli.run().await });
+    let url = format!("http://127.0.0.1:{}/mcp", addr.port());
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "list_indices",
+            "arguments": {
+                "index_pattern": "test-index"
+            }
+        }
+    });
+
+    let client = Client::builder().build()?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let response = client
+        .post(url)
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "application/json, text/event-stream")
+        .header("Authorization", "ApiKey value-from-the-test")
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let response_body: serde_json::Value = parse_response(response).await?;
+
+    assert_eq!(response_body["result"]["content"][0]["text"], "Found 1 indices:");
+    assert_eq!(
+        response_body["result"]["content"][1]["text"],
+        "[{\"index\":\"test-index\"}]"
+    );
+    assert_eq!(
+        response_body["result"]["content"][2]["text"],
+        "Warning: _cat/indices is forbidden for this user; returned index names from mappings without status or docs.count."
+    );
+
+    Ok(())
+}
+
 const LOCALHOST_0: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn find_address() -> anyhow::Result<SocketAddr> {
     // Find a free port

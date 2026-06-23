@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::servers::elasticsearch::{EsClientProvider, read_json};
+use crate::servers::elasticsearch::{EsClientProvider, internal_error, read_json};
 use elasticsearch::cat::{CatIndicesParts, CatShardsParts};
 use elasticsearch::indices::IndicesGetMappingParts;
 use elasticsearch::{Elasticsearch, SearchParts};
@@ -105,12 +105,50 @@ impl EsBaseTools {
             .send()
             .await;
 
-        let response: Vec<CatIndexResponse> = read_json(response).await?;
+        let (response, warning): (Vec<CatIndexResponse>, Option<&str>) = match response {
+            Ok(response) if response.status_code().as_u16() == 403 => {
+                let response: HashMap<String, Value> = read_json(
+                    es_client
+                        .indices()
+                        .get_mapping(IndicesGetMappingParts::Index(&[&index_pattern]))
+                        .send()
+                        .await,
+                )
+                .await?;
 
-        Ok(CallToolResult::success(vec![
+                let mut response: Vec<CatIndexResponse> = response
+                    .into_keys()
+                    .map(|index| CatIndexResponse {
+                        index,
+                        status: None,
+                        doc_count: None,
+                    })
+                    .collect();
+                response.sort_by(|a, b| a.index.cmp(&b.index));
+                (
+                    response,
+                    Some(
+                        "Warning: _cat/indices is forbidden for this user; returned index names from mappings without status or docs.count.",
+                    ),
+                )
+            }
+            Ok(response) => {
+                let response = response.error_for_status_code().map_err(internal_error)?;
+                let response = response.json().await.map_err(internal_error)?;
+                (response, None)
+            }
+            Err(e) => return Err(internal_error(e)),
+        };
+
+        let mut content = vec![
             Content::text(format!("Found {} indices:", response.len())),
             Content::json(response)?,
-        ]))
+        ];
+        if let Some(warning) = warning {
+            content.push(Content::text(warning));
+        }
+
+        Ok(CallToolResult::success(content))
     }
 
     //---------------------------------------------------------------------------------------------
@@ -335,9 +373,15 @@ pub struct Hit {
 #[derive(Serialize, Deserialize)]
 pub struct CatIndexResponse {
     pub index: String,
-    pub status: String,
-    #[serde(rename = "docs.count", deserialize_with = "deserialize_number_from_string")]
-    pub doc_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(
+        rename = "docs.count",
+        default,
+        deserialize_with = "deserialize_option_number_from_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub doc_count: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
